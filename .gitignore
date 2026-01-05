@@ -1,0 +1,14 @@
+# Ignore Virtual Environments
+venv/
+.venv/
+env/
+
+# Ignore Large Data Folders
+raw/
+processed/
+data/
+
+# Ignore Python Cache and OS files
+__pycache__/
+*.pyc
+.DS_Store
