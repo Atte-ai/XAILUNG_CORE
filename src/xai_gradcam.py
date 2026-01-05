@@ -1,22 +1,21 @@
 import tensorflow as tf
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-import pandas as pd
 import os
+import matplotlib.pyplot as plt
+from PIL import Image
 
-# 1. Setup
-if not os.path.exists('visuals'):
-    os.makedirs('visuals')
+# --- 1. CORE GRAD-CAM LOGIC ---
 
-model = tf.keras.models.load_model('models/xailung_multimodal_best.keras')
-
-# From your error log, the last relevant layer for the Histo branch is 'out_relu'
-last_conv_layer_name = "out_relu" 
-
-def make_gradcam_heatmap(img_inputs, model, last_conv_layer_name):
-    # Create a model that maps the inputs to the activations of the last conv layer
-    # and the final predictions
+def make_gradcam_heatmap(img_inputs, model, last_conv_layer_name="out_relu"):
+    """
+    Computes the Grad-CAM heatmap for the pathology branch.
+    Args:
+        img_inputs: List of [ct_tensor, histo_tensor, meta_tensor]
+        model: The loaded Keras model
+        last_conv_layer_name: The name of the layer to monitor (e.g., 'out_relu')
+    """
+    # Create a sub-model that outputs the last conv layer and the final prediction
     grad_model = tf.keras.models.Model(
         inputs=model.inputs,
         outputs=[model.get_layer(last_conv_layer_name).output, model.output]
@@ -24,54 +23,85 @@ def make_gradcam_heatmap(img_inputs, model, last_conv_layer_name):
 
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_inputs)
-        # We target the 'Malignant' probability (index 0 usually, but let's be safe)
+        # Target the malignancy probability channel
         class_channel = preds[:, 0]
 
-    # Gradient of the output neuron wrt the feature map
+    # Calculate gradients of the class with respect to the feature map
     grads = tape.gradient(class_channel, last_conv_layer_output)
 
-    # Vector of intensity of gradients over the feature map
+    # Global Average Pooling of the gradients
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    # Multiply each channel in the feature map by 'how important this channel is'
+    # Weight the feature map channels by the gradient importance
     last_conv_layer_output = last_conv_layer_output[0]
     heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
-    # Normalize the heatmap between 0 & 1
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    # Normalize heatmap between 0 and 1
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
-# 2. Select a Malignant Sample
-df = pd.read_csv("data/metadata/multimodal_master.csv")
-sample = df[df['label'] == 1].iloc[0] 
+def generate_superimposed_image(original_img, heatmap, alpha=0.6):
+    """
+    Overlays the heatmap on the original image.
+    Args:
+        original_img: NumPy array of the original histo patch (0-255 or 0-1)
+        heatmap: The 2D heatmap array from make_gradcam_heatmap
+    """
+    # Ensure original image is 0-255 uint8
+    if original_img.max() <= 1.0:
+        img = (original_img * 255).astype(np.uint8)
+    else:
+        img = original_img.astype(np.uint8)
 
-# Prepare inputs (using the names from your layer list)
-ct = np.expand_dims(np.load(sample['ct_path'])[..., np.newaxis], axis=0)
-histo = np.expand_dims(np.load(sample['histo_path']), axis=0)
-meta = np.array([[sample['age'], sample['smoking_history']]])
+    # Resize heatmap to match image size
+    heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+    
+    # Convert heatmap to RGB colormap
+    heatmap_resized = np.uint8(255 * heatmap_resized)
+    heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
-# 3. Generate and Save
-print("Generating Grad-CAM for Pathology branch...")
-heatmap = make_gradcam_heatmap([ct, histo, meta], model, last_conv_layer_name)
+    # Combine original and heatmap
+    superimposed_img = cv2.addWeighted(img, alpha, heatmap_color, 1 - alpha, 0)
+    return superimposed_img
 
-# Rescale heatmap to 0-255 and apply colormap
-img = (histo[0] * 255).astype(np.uint8) # Original image
-heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-heatmap_resized = np.uint8(255 * heatmap_resized)
-heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
 
-# Superimpose the heatmap on original image
-superimposed_img = cv2.addWeighted(img, 0.6, heatmap_color, 0.4, 0)
+# --- 2. BATCH EXECUTION LOGIC ---
+# This part only runs if you run this file directly: python src/xai_gradcam.py
+if __name__ == "__main__":
+    import pandas as pd
+    
+    print("🧪 Running XAI Validation Script...")
+    
+    if not os.path.exists('visuals'):
+        os.makedirs('visuals')
 
-# Save result
-plt.figure(figsize=(10, 5))
-plt.subplot(1, 2, 1)
-plt.imshow(img)
-plt.title("Original Histopathology")
-plt.subplot(1, 2, 2)
-plt.imshow(superimposed_img)
-plt.title("Grad-CAM Explainability")
-plt.savefig('visuals/gradcam_histo_final.png')
+    # Load resources
+    model_path = 'models/xailung_multimodal_best.keras'
+    if os.path.exists(model_path):
+        model = tf.keras.models.load_model(model_path)
+        last_conv_layer_name = "out_relu" 
 
-print("Success! Grad-CAM visualization saved to visuals/gradcam_histo_final.png")
+        # Load a sample from metadata
+        try:
+            df = pd.read_csv("data/metadata/multimodal_master.csv")
+            sample = df[df['label'] == 1].iloc[0] 
+
+            # Prepare inputs
+            ct = np.expand_dims(np.load(sample['ct_path'])[..., np.newaxis], axis=0)
+            histo = np.expand_dims(np.load(sample['histo_path']), axis=0)
+            meta = np.array([[sample['age'], sample['smoking_history']]])
+
+            # Generate
+            heatmap = make_gradcam_heatmap([ct, histo, meta], model, last_conv_layer_name)
+            vis_img = generate_superimposed_image(histo[0], heatmap)
+
+            # Save
+            plt.imsave('visuals/gradcam_histo_final.png', vis_img)
+            print("✅ Success! Visualization saved to visuals/gradcam_histo_final.png")
+            
+        except Exception as e:
+            print(f"❌ Error during sample processing: {e}")
+    else:
+        print(f"❌ Model not found at {model_path}")
