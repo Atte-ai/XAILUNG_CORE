@@ -12,3 +12,11 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+# Ignore the massive data folder
+data/
+
+# Ignore the virtual environment
+venv/
+
+# Ignore Mac system files
+.DS_Store
